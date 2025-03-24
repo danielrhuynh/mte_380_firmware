@@ -393,7 +393,7 @@ void loop() {
       // Command to close the servo (move to 0°)
       servoClose();
     } else if (inputString.startsWith("GET_ENC")) {
-      // Command to get encoder values for the 180 degree turn
+      // Command to get encoder values
       Serial.print("ENC_");
       Serial.print(left_ticks);
       Serial.print(",");
