@@ -1,10 +1,9 @@
 #include <Arduino.h>
-#include <stdlib.h>  // for atoi and atof
-#include <string.h>  // for strtok
+#include <stdlib.h>   // for atoi and atof
+#include <string.h>   // for strtok
 #include <ESP32Servo.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
-
 
 // -----------------------------------
 // New Pin Definitions for ESP32
@@ -19,7 +18,7 @@ const int M2_IN1 = 32;
 const int M2_IN2 = 33;
 const int M2_EN  = 14;   // PWM via LEDC
 
-// Encoder Pins (if needed)
+// Encoder Pins
 const int ENC_A_LEFT  = 4;
 const int ENC_A_RIGHT = 5;
 
@@ -33,36 +32,17 @@ volatile long left_ticks = 0;
 volatile long right_ticks = 0;
 
 // -----------------------------------
+// Ticks Conversion Constants
+// -----------------------------------
+// For driving straight: 
+// Wheel diameter = 65 mm, so circumference ≈ 65 * PI ≈ 204.2 mm,
+// and 170 ticks per revolution → TICKS_PER_MM ≈ 170 / 204.2 ≈ 0.832.
+const float TICKS_PER_MM = 0.7904;
+
+// -----------------------------------
 // Servo Object
 // -----------------------------------
 Servo myServo;
-
-// -----------------------------------
-// Encoder Interrupt Service Routines
-// -----------------------------------
-void IRAM_ATTR leftEncoderPressed() {
-  left_ticks++;
-}
-
-void IRAM_ATTR rightEncoderPressed() {
-  right_ticks++;
-}
-
-// -----------------------------------
-// Serial Input Handling Variables
-// -----------------------------------
-String inputString = "";     // String to hold incoming data
-bool stringComplete = false; // Flag for completed string
-
-// Helper function to clear the serial bugger on start
-void clearSerialBuffer() {
-  while(Serial.available() > 0) {
-    Serial.read(); // Read and discard each byte
-  }
-
-  inputString = "";
-  stringComplete = false;
-}
 
 // -----------------------------------
 // MotorDriver Class Definition
@@ -70,10 +50,11 @@ void clearSerialBuffer() {
 class MotorDriver {
   public:
     int in1Pin, in2Pin, enPin, pwmChannel;
-    
-    // Constructor: initialize pins and set up PWM (using LEDC)
+    // New flag: true means “forward” so add ticks; false means reverse so subtract ticks.
+    volatile bool tick_direction;
+
     MotorDriver(int in1, int in2, int en, int channel)
-      : in1Pin(in1), in2Pin(in2), enPin(en), pwmChannel(channel) {
+      : in1Pin(in1), in2Pin(in2), enPin(en), pwmChannel(channel), tick_direction(true) {
       pinMode(in1Pin, OUTPUT);
       pinMode(in2Pin, OUTPUT);
       // Configure PWM: 5000 Hz frequency, 8-bit resolution (0-255)
@@ -81,8 +62,11 @@ class MotorDriver {
       ledcAttachPin(enPin, pwmChannel);
     }
     
-    // Run motor at given speed (0-255); direction: true = forward
+    // Run motor at given speed (0-255) with a direction flag.
+    // forward==true means “forward” so we add encoder ticks;
+    // forward==false means reverse so we subtract ticks.
     void run(int speed, bool forward) {
+      tick_direction = forward; // update flag for encoder ticks
       if (forward) {
         digitalWrite(in1Pin, LOW);
         digitalWrite(in2Pin, HIGH);
@@ -101,21 +85,39 @@ class MotorDriver {
     }
 };
 
-// Instantiate motor driver objects using unique LEDC channels (0 and 1)
+// Instantiate motor driver objects using unique LEDC channels
 MotorDriver motor_left(M1_IN1, M1_IN2, M1_EN, 0);
 MotorDriver motor_right(M2_IN1, M2_IN2, M2_EN, 1);
 
 // -----------------------------------
-// PID Controller Variables
+// Encoder Interrupt Service Routines
+// -----------------------------------
+void IRAM_ATTR leftEncoderPressed() {
+  if (motor_left.tick_direction) {
+    left_ticks++;
+  } else {
+    left_ticks--;
+  }
+}
+
+void IRAM_ATTR rightEncoderPressed() {
+  if (motor_right.tick_direction) {
+    right_ticks++;
+  } else {
+    right_ticks--;
+  }
+}
+
+// -----------------------------------
+// Existing PID Controller Variables (for straight-line control)
 // -----------------------------------
 float prev_error = 0;
 float integral_error = 0;
 unsigned long last_pid_time = 0;
 
 // -----------------------------------
-// Motor Control (PID) Callback Function
+// Motor Control (PID) Callback Function (existing)
 // -----------------------------------
-// Accepts error value and optional PID & speed parameters.
 void motorControlCallback(int error,
                           int base_speed,   // default ~200
                           int min_speed,    // default ~100
@@ -124,12 +126,10 @@ void motorControlCallback(int error,
                           float Ki,
                           float Kd) {
   unsigned long current_time = millis();
-  // Calculate dt in seconds
   float dt = (current_time - last_pid_time) / 1000.0;
   last_pid_time = current_time;
   if (dt < 0.001) dt = 0.001;
   
-  // Compute PID terms
   float p_term = Kp * error;
   integral_error += error * dt;
   float max_integral = 100;
@@ -142,15 +142,12 @@ void motorControlCallback(int error,
   
   float correction = p_term + i_term + d_term;
   
-  // Apply correction: positive error increases left motor speed, decreases right motor speed.
   float left_speed_f  = base_speed + correction;
   float right_speed_f = base_speed - correction;
   
-  // Constrain speeds to [min_speed, max_speed]
   int left_speed  = constrain((int)left_speed_f, min_speed, max_speed);
   int right_speed = constrain((int)right_speed_f, min_speed, max_speed);
   
-  // Run both motors forward at the calculated speeds
   bool left_forward_bool = left_speed > 0;
   bool right_forward_bool = right_speed > 0;
   motor_left.run(left_speed, left_forward_bool);
@@ -158,196 +155,220 @@ void motorControlCallback(int error,
 }
 
 // -----------------------------------
-// Turn Robot by Specified Degrees
+// PID Controller for Turning
 // -----------------------------------
-// Turn control variables
-bool turn_in_progress = false;
-int turn_target_ticks = 0;
-bool turn_clockwise = true;
-const float TICKS_PER_DEGREE = 0.4722; // 170 ticks / 360° given by Jackie
+const float TICKS_PER_DEGREE = 1.235; // Example conversion factor for turning
 
-// Turn PID variables
-float turn_kp = 1.0;
-float turn_ki = 0.0;
-float turn_kd = 0.05;
-float turn_prev_error = 0;
-float turn_integral = 0;
-unsigned long turn_last_time = 0;
-void startTurn(int degrees, bool clockwise = true, float kp = 1.0, float ki = 0.0, float kd = 0.05, float slipping_factor = 1.5) {
-  clearSerialBuffer();
+void turnPID(float target_degrees, int max_speed = 255, int min_speed = 100,
+             float Kp_diff = 0.5, float Ki_diff = 0.0, float Kd_diff = 0.1,
+             float Kp_base = 2.0) {
   left_ticks = 0;
   right_ticks = 0;
   
-  // turn_target_ticks = (degrees * TICKS_PER_DEGREE) / 2;
-  turn_target_ticks = (degrees * TICKS_PER_DEGREE * slipping_factor);
-  turn_clockwise = clockwise;
+  float target_ticks = abs(target_degrees) * TICKS_PER_DEGREE;
   
-  turn_kp = kp;
-  turn_ki = ki;
-  turn_kd = kd;
-  
-  turn_prev_error = 0;
-  turn_integral = 0;
-  turn_last_time = millis();
-  
-  turn_in_progress = true;
-  Serial.print("Starting turn of ");
-  Serial.print(degrees);
-  Serial.print(" degrees with PID: ");
-  Serial.print(kp); Serial.print(", ");
-  Serial.print(ki); Serial.print(", ");
-  Serial.print(kd); Serial.print(", ");
-  Serial.println(slipping_factor);
-}
-
-void updateTurn() {
-  if (!turn_in_progress) return;
-  
-  // Use average ticks in case one wheel experiences more slipping than the other
-  int avg_ticks = (left_ticks + right_ticks) / 2;
-  
-  if (avg_ticks >= turn_target_ticks) {
-    motor_left.stop();
-    motor_right.stop();
-    turn_in_progress = false;
-    
-    Serial.print("Turn completed: ");
-    Serial.print(avg_ticks);
-    Serial.print(" avg ticks (target: ");
-    Serial.print(turn_target_ticks);
-    Serial.print("), L:");
-    Serial.print(left_ticks);
-    Serial.print(" R:");
-    Serial.println(right_ticks);
-    return;
-  }
-  
-  // Add safety timeout
-  static unsigned long turn_start_time = 0;
-  if (turn_start_time == 0) turn_start_time = millis();
-  
-  // Stop turn after 10s
-  if (millis() - turn_start_time > 10000) {
-    motor_left.stop();
-    motor_right.stop();
-    turn_in_progress = false;
-    Serial.println("Turn timeout - stopped at " + String(avg_ticks) + " ticks");
-    turn_start_time = 0;
-    return;
-  }
-  
-  int error = turn_target_ticks - avg_ticks;
-  
-  unsigned long current_time = millis();
-  float dt = (current_time - turn_last_time) / 1000.0;
-  turn_last_time = current_time;
-  if (dt < 0.001) dt = 0.001;  // Prevent division by zero
-  
-  float p_term = turn_kp * error;
-  
-  turn_integral += error * dt;
-  float max_integral = 100;
-  if (turn_integral > max_integral) turn_integral = max_integral;
-  else if (turn_integral < -max_integral) turn_integral = -max_integral;
-  float i_term = turn_ki * turn_integral;
-  
-  float derivative = (error - turn_prev_error) / dt;
-  float d_term = turn_kd * derivative;
-  turn_prev_error = error;
-  
-  // Calculate motor speed based on PID output
-  float pid_output = p_term + i_term + d_term;
-  int base_speed = 250;
-  int turn_speed = constrain(base_speed + (int)pid_output, 80, 255);
-  int RIGHT_WHEEL_ADJUSTMENT_FACTOR = 2;
-  
-  // Apply motor control based on turning direction
-  if (turn_clockwise) {
-    motor_left.run(turn_speed, true);    // Left motor forward
-    motor_right.run(turn_speed * RIGHT_WHEEL_ADJUSTMENT_FACTOR, false);  // Right motor backward
+  bool left_forward, right_forward;
+  if (target_degrees > 0) {
+    left_forward = true;
+    right_forward = false;
   } else {
-    motor_left.run(turn_speed, false);   // Left motor backward
-    motor_right.run(turn_speed * RIGHT_WHEEL_ADJUSTMENT_FACTOR, true);   // Right motor forward
+    left_forward = false;
+    right_forward = true;
   }
   
-  // Reset timeout when a new turn starts
-  if (!turn_in_progress) turn_start_time = 0;
+  float prev_diff_error = 0;
+  float integral_diff = 0;
+  unsigned long last_time = millis();
+  
+  while (((abs(left_ticks) + abs(right_ticks)) / 2.0) < target_ticks) {
+    unsigned long current_time = millis();
+    float dt = (current_time - last_time) / 1000.0;
+    if (dt <= 0) dt = 0.001;
+    last_time = current_time;
+    
+    float diff_error = left_ticks + right_ticks;
+    integral_diff += diff_error * dt;
+    float derivative_diff = (diff_error - prev_diff_error) / dt;
+    prev_diff_error = diff_error;
+    float correction = Kp_diff * diff_error + Ki_diff * integral_diff + Kd_diff * derivative_diff;
+    
+    float avg_ticks = (abs(left_ticks) + abs(right_ticks)) / 2.0;
+    float distance_error = target_ticks - avg_ticks;
+    
+    int base_speed = min_speed + (int)(Kp_base * distance_error);
+    if (base_speed > max_speed) base_speed = max_speed;
+    if (base_speed < min_speed) base_speed = min_speed;
+    
+    int left_speed, right_speed;
+    if (target_degrees > 0) { // Clockwise: left forward, right backward
+      left_speed = base_speed - (int)correction;
+      right_speed = base_speed + (int)correction;
+    } else { // Counter-clockwise: left backward, right forward
+      left_speed = base_speed + (int)correction;
+      right_speed = base_speed - (int)correction;
+    }
+    
+    left_speed = constrain(left_speed, min_speed, max_speed);
+    right_speed = constrain(right_speed, min_speed, max_speed);
+    
+    motor_left.run(left_speed, left_forward);
+    motor_right.run(right_speed, right_forward);
+    
+    delay(10);
+  }
+  
+  motor_left.stop();
+  motor_right.stop();
 }
 
 // -----------------------------------
-// Servo Functions
+// PID Controller for Driving Straight
 // -----------------------------------
-int pos = 0;    // variable to store the servo position
+// This function drives the robot straight for a desired distance (in mm).
+// It uses one PID loop to correct the difference between the two wheels (error = left_ticks - right_ticks)
+// and a second PID loop to set the base speed based on the distance error.
+// PID Controller for Driving Straight (Modified for Negative Distances)
+void driveStraightPID(float target_distance, int max_speed = 255, int min_speed = 100,
+  float Kp_diff = 0.5, float Ki_diff = 0.0, float Kd_diff = 0.1,
+  float Kp_base = 2.0) {
+// Reset encoder ticks
+left_ticks = 0;
+right_ticks = 0;
+
+// Determine drive direction: forward if target_distance >= 0, backwards otherwise.
+bool drive_forward = (target_distance >= 0);
+
+// Compute the target tick count (use absolute value)
+float target_ticks = fabs(target_distance) * TICKS_PER_MM;
+
+// PID variables for the wheel difference correction.
+float prev_diff_error = 0;
+float integral_diff = 0;
+unsigned long last_time = millis();
+
+while (((abs(left_ticks) + abs(right_ticks)) / 2.0) < target_ticks) {
+unsigned long current_time = millis();
+float dt = (current_time - last_time) / 1000.0;
+if (dt <= 0) dt = 0.001;
+last_time = current_time;
+
+// Difference error: ideally both encoders should count equally.
+float diff_error = left_ticks - right_ticks;
+integral_diff += diff_error * dt;
+float derivative_diff = (diff_error - prev_diff_error) / dt;
+prev_diff_error = diff_error;
+float correction = Kp_diff * diff_error + Ki_diff * integral_diff + Kd_diff * derivative_diff;
+
+// Distance error based on the average of the absolute encoder ticks.
+float avg_ticks = (abs(left_ticks) + abs(right_ticks)) / 2.0;
+float distance_error = target_ticks - avg_ticks;
+
+// Calculate a base speed that decreases as the robot nears the target distance.
+int base_speed = min_speed + (int)(Kp_base * distance_error);
+if (base_speed > max_speed) base_speed = max_speed;
+if (base_speed < min_speed) base_speed = min_speed;
+
+// Adjust motor speeds using the correction.
+// If left wheel is ahead (diff_error > 0), slow left and speed up right.
+int left_speed = base_speed - (int)correction;
+int right_speed = base_speed + (int)correction;
+if (!drive_forward) {
+  left_speed = base_speed + (int)correction;
+  right_speed = base_speed - (int)correction;
+}
+
+left_speed = constrain(left_speed, min_speed, max_speed);
+right_speed = constrain(right_speed, min_speed, max_speed);
+
+// Run both motors in the same direction:
+// 'true' for forward, 'false' for reverse.
+motor_left.run(left_speed, drive_forward);
+motor_right.run(right_speed, drive_forward);
+
+delay(10);
+}
+
+motor_left.stop();
+motor_right.stop();
+}
+
+
+// -----------------------------------
+// Servo Functions (unchanged)
+// -----------------------------------
+int pos = 0;
 void servoClose() {
-  // Move servo to 0° (closed position)
+  if (!myServo.attached()) {
+    myServo.attach(SERVO_PIN, 1000, 2000);
+    delay(100);
+  }
   myServo.write(0);
+  delay(1000);
+  myServo.detach();
   Serial.println("Servo Closed");
 }
 
 void servoOpen() {
-  // Move servo to 90° (open position)
+  if (!myServo.attached()) {
+    myServo.attach(SERVO_PIN, 1000, 2000);
+    delay(100);
+  }
   myServo.write(180);
+  delay(1000);
+  myServo.detach();
   Serial.println("Servo Opened");
 }
+
+// -----------------------------------
+// Serial Input Handling Variables
+// -----------------------------------
+String inputString = "";
+bool stringComplete = false;
 
 // -----------------------------------
 // Arduino Setup
 // -----------------------------------
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-  Serial.setRxBufferSize(4096);  // Increase RX buffer size
+  Serial.setRxBufferSize(4096);
   Serial.begin(921600);
   
-  // Setup encoder pins with internal pull-ups (if using encoders)
   pinMode(ENC_A_LEFT, INPUT_PULLUP); 
   pinMode(ENC_A_RIGHT, INPUT_PULLUP);
   
-  // Attach interrupts to encoder pins (trigger on FALLING edge)
   attachInterrupt(digitalPinToInterrupt(ENC_A_LEFT), leftEncoderPressed, FALLING);
   attachInterrupt(digitalPinToInterrupt(ENC_A_RIGHT), rightEncoderPressed, FALLING);
   
-  // Initialize PID timing
   last_pid_time = millis();
-  
-  // Reserve space for incoming serial data
   inputString.reserve(200);
   
-  // Setup Servo
   ESP32PWM::allocateTimer(0);
-	ESP32PWM::allocateTimer(1);
-	ESP32PWM::allocateTimer(2);
-	ESP32PWM::allocateTimer(3);
-  myServo.setPeriodHertz(50);// Standard 50hz servo
-  myServo.attach(SERVO_PIN, 1000, 2000);  // 1000-2000 μs pulse range
-  myServo.write(0);  // Start at 0° (closed)
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  myServo.setPeriodHertz(50);
 }
 
 // -----------------------------------
 // Arduino Main Loop
 // -----------------------------------
 void loop() {
-  // Process serial commands when a complete string is received
   if (stringComplete) {
     inputString.trim();
     
-    // Check if command starts with "MC_"
     if (inputString.startsWith("MC_")) {
-      String params = inputString.substring(3); // Remove "MC_" prefix
-      
-      // Default parameters will be overwritten by actual controller
+      String params = inputString.substring(3);
       int errorVal = 0;
-      int baseSpeed = 200; // default base_speed
-      int minSpeed  = 100; // default min_speed
-      int maxSpeed  = 255; // default max_speed
+      int baseSpeed = 200;
+      int minSpeed  = 100;
+      int maxSpeed  = 255;
       float kp = 0.1;
       float ki = 0.0;
       float kd = 0.0;
       
-      // If no comma, then only error is provided
       if (params.indexOf(',') == -1) {
         errorVal = params.toInt();
       } else {
-        // Convert the parameters string to a char array for tokenization
         char buf[100];
         params.toCharArray(buf, 100);
         char *token = strtok(buf, ",");
@@ -383,80 +404,139 @@ void loop() {
         }
       }
       
-      // Call the motor control callback with the parsed parameters
       motorControlCallback(errorVal, baseSpeed, minSpeed, maxSpeed, kp, ki, kd);
       
-    } else if (inputString.startsWith("OPEN")) {
-      // Command to open the servo (move to 90°)
-      servoOpen();
-    } else if (inputString.startsWith("CLOSE")) {
-      // Command to close the servo (move to 0°)
-      servoClose();
-    } else if (inputString.startsWith("GET_ENC")) {
-      // Command to get encoder values
-      Serial.print("ENC_");
-      Serial.print(left_ticks);
-      Serial.print(",");
-      Serial.println(right_ticks);
-    } else if (inputString.startsWith("TURN_DEG")) {
-      int degrees = 180;
-      float kp = 1.0;     // Default PID constants
-      float ki = 0.0;
-      float kd = 0.05;
-      bool clockwise = true;
-      float slipping_factor = 2.8;
+    } else if (inputString.startsWith("TURN")) {
+      int commaIndex = inputString.indexOf(',');
+      float target_degrees = 0;
+      int max_speed = 255;
+      int min_speed = 100;
+      float Kp_diff = 0.5;
+      float Ki_diff = 0.0;
+      float Kd_diff = 0.1;
+      float Kp_base = 2.0;
       
-      if (inputString.indexOf('_') != -1) {
-        // Split by underscores to get parameters
-        String parts[5];  // Max 5 parts: TURN_DEG_degrees_kp_ki_kd
-        int partCount = 0;
-        int startPos = 0;
-        int endPos = 0;
-        
-        while (endPos >= 0 && partCount < 5) {
-          endPos = inputString.indexOf('_', startPos);
-          if (endPos >= 0) {
-            parts[partCount++] = inputString.substring(startPos, endPos);
-            startPos = endPos + 1;
-          } else {
-            parts[partCount++] = inputString.substring(startPos);
+      if (commaIndex > 0) {
+        String params = inputString.substring(commaIndex + 1);
+        char buf[100];
+        params.toCharArray(buf, 100);
+        char *token = strtok(buf, ",");
+        int tokenIndex = 0;
+        while(token != NULL) {
+          switch(tokenIndex) {
+            case 0:
+              target_degrees = atof(token);
+              break;
+            case 1:
+              max_speed = atoi(token);
+              break;
+            case 2:
+              min_speed = atoi(token);
+              break;
+            case 3:
+              Kp_diff = atof(token);
+              break;
+            case 4:
+              Ki_diff = atof(token);
+              break;
+            case 5:
+              Kd_diff = atof(token);
+              break;
+            case 6:
+              Kp_base = atof(token);
+              break;
+            default:
+              break;
           }
-        }
-        
-        // Process parameters based on how many were provided
-        if (partCount > 2) {  // At least TURN_DEG_degrees
-          degrees = parts[2].toInt();
-        }
-        
-        if (partCount > 3) {  // Has Kp
-          kp = parts[3].toFloat();
-        }
-        
-        if (partCount > 4) {  // Has Ki
-          ki = parts[4].toFloat();
-        }
-        
-        if (partCount > 5) {  // Has Kd
-          kd = parts[5].toFloat();
-        }
-
-        if (partCount > 6) {  // Has slip factor
-          slipping_factor = parts[6].toFloat();
+          token = strtok(NULL, ",");
+          tokenIndex++;
         }
       }
       
-      if (degrees <= 0) degrees = 180;
+      turnPID(target_degrees, max_speed, min_speed, Kp_diff, Ki_diff, Kd_diff, Kp_base);
+      Serial.print("COMPLETE");
+    } else if (inputString.startsWith("DRIVE")) {
+      // Serial command example:
+      // "DRIVE,1000" or "DRIVE,1000,255,100,0.5,0,0.1,2.0"
+      // where parameters are:
+      // target_distance (mm), max_speed, min_speed, Kp_diff, Ki_diff, Kd_diff, Kp_base
+      int commaIndex = inputString.indexOf(',');
+      float target_distance = 0;
+      int max_speed = 255;
+      int min_speed = 100;
+      float Kp_diff = 0.5;
+      float Ki_diff = 0.0;
+      float Kd_diff = 0.1;
+      float Kp_base = 2.0;
       
-      startTurn(degrees, clockwise, kp, ki, kd, slipping_factor);
-    } else {
+      if (commaIndex > 0) {
+        String params = inputString.substring(commaIndex + 1);
+        char buf[100];
+        params.toCharArray(buf, 100);
+        char *token = strtok(buf, ",");
+        int tokenIndex = 0;
+        while(token != NULL) {
+          switch(tokenIndex) {
+            case 0:
+              target_distance = atof(token);
+              break;
+            case 1:
+              max_speed = atoi(token);
+              break;
+            case 2:
+              min_speed = atoi(token);
+              break;
+            case 3:
+              Kp_diff = atof(token);
+              break;
+            case 4:
+              Ki_diff = atof(token);
+              break;
+            case 5:
+              Kd_diff = atof(token);
+              break;
+            case 6:
+              Kp_base = atof(token);
+              break;
+            default:
+              break;
+          }
+          token = strtok(NULL, ",");
+          tokenIndex++;
+        }
+      }
+      
+      driveStraightPID(target_distance, max_speed, min_speed, Kp_diff, Ki_diff, Kd_diff, Kp_base);
+      Serial.print("COMPLETE");
+      
+    } else if (inputString.startsWith("GET_ENC")) {
+      Serial.print("Left ticks: ");
+      Serial.print(left_ticks);
+      Serial.print(", Right ticks: ");
+      Serial.println(right_ticks);
+      
+    } else if (inputString.startsWith("OPEN")) {
+      servoOpen();
+    } else if (inputString.startsWith("CLOSE")) {
+      servoClose();
+    }
+      else if (inputString.startsWith("STOP")) {
+      motor_left.stop();
+      motor_right.stop();
+      motor_left.run(100, !motor_left.tick_direction);
+      motor_right.run(100, !motor_right.tick_direction);
+    }
+    else {
       Serial.print("Unknown command: ");
       Serial.println(inputString);
     }
+    if((left_ticks + right_ticks) / 2 > 25000){
+      Serial.println("PASS");
+    }
+    
     inputString = "";
     stringComplete = false;
-    
   }
-  updateTurn();
 }
 
 // -----------------------------------
